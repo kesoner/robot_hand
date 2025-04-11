@@ -3,11 +3,11 @@
 #include <ArduinoJson.h>
 
 // WiFi 設定
-const char* ssid = "Kesonorn";
-const char* password = "KS132842";
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
 // MQTT Broker 設定
-const char* mqtt_broker = "broker.emqx.io";  // 使用公共 MQTT broker
+const char* mqtt_broker = "broker.emqx.io";
 const int mqtt_port = 1883;
 const char* mqtt_topic = "flex_glove/data";
 
@@ -16,32 +16,33 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 // 定義 flex sensor 接腳
-const int THUMB_PIN = 36;   // 拇指 (VP)
-const int INDEX_PIN = 39;   // 食指 (VN)
+const int THUMB_PIN = 32;   // 拇指
+const int INDEX_PIN = 33;   // 食指
 const int MIDDLE_PIN = 34;  // 中指
 const int RING_PIN = 35;    // 無名指
-const int PINKY_PIN = 32;   // 小指
+const int PINKY_PIN = 36;   // 小指
 
-// 校準值
+// 校準值結構
 struct CalibrationValues {
-    int straight;  // 手指伸直時的值
-    int bent;      // 手指彎曲時的值
+    int straight;  // 手指伸直時的 ADC 值（約 1000-2000）
+    int bent;      // 手指彎曲時的 ADC 值（約 2000-3000）
 };
 
+// 每個手指的校準值
 CalibrationValues calibration[5] = {
-    {0, 1000},  // 拇指
-    {0, 1000},  // 食指
-    {0, 1000},  // 中指
-    {0, 1000},  // 無名指
-    {0, 1000}   // 小指
+    {0, 1000},  // 拇指的校準值範圍
+    {0, 1000},  // 食指的校準值範圍
+    {0, 1000},  // 中指的校準值範圍
+    {0, 1000},  // 無名指的校準值範圍
+    {0, 1000}   // 小指的校準值範圍
 };
 
-// 用於平滑化讀數的變數
-const int numReadings = 10;
-int readings[5][numReadings];
-int readIndex[5] = {0, 0, 0, 0, 0};
-int total[5] = {0, 0, 0, 0, 0};
-float average[5] = {0, 0, 0, 0, 0};
+// 用於平滑化讀數的變數（減少數值跳動）
+const int numReadings = 10;        // 平均值取樣數
+int readings[5][numReadings];      // 儲存每個手指的最近 10 次讀數
+int readIndex[5] = {0, 0, 0, 0, 0}; // 目前的讀數索引
+int total[5] = {0, 0, 0, 0, 0};     // 讀數總和
+float average[5] = {0, 0, 0, 0, 0}; // 平均值
 
 // 時間控制
 unsigned long lastSendTime = 0;
@@ -84,11 +85,13 @@ void loop() {
     if (currentTime - lastSendTime >= sendInterval) {
         // 準備 JSON 數據
         StaticJsonDocument<200> doc;
-        doc["thumb"] = (int)average[0];
-        doc["index"] = (int)average[1];
-        doc["middle"] = (int)average[2];
-        doc["ring"] = (int)average[3];
-        doc["pinky"] = (int)average[4];
+        
+        // 儲存處理後的數值（0-100 範圍）
+        doc["thumb"] = (int)average[0];   // 拇指彎曲度
+        doc["index"] = (int)average[1];   // 食指彎曲度
+        doc["middle"] = (int)average[2];  // 中指彎曲度
+        doc["ring"] = (int)average[3];    // 無名指彎曲度
+        doc["pinky"] = (int)average[4];   // 小指彎曲度
         
         String output;
         serializeJson(doc, output);
@@ -96,9 +99,15 @@ void loop() {
         // 發送到 MQTT
         client.publish(mqtt_topic, output.c_str());
         
-        // 顯示發送的數據
+        // 顯示發送的數據和原始 ADC 值
         Serial.print("發送數據: ");
         Serial.println(output);
+        Serial.println("原始 ADC 值:");
+        for (int i = 0; i < 5; i++) {
+            Serial.print(readings[i][readIndex[i]]);
+            Serial.print("\t");
+        }
+        Serial.println();
         
         lastSendTime = currentTime;
     }
@@ -109,7 +118,7 @@ void updateSensorReadings() {
     int sensorPins[] = {THUMB_PIN, INDEX_PIN, MIDDLE_PIN, RING_PIN, PINKY_PIN};
     
     for (int i = 0; i < 5; i++) {
-        // 從感測器讀取數值
+        // 從感測器讀取 ADC 值（0-4095）
         int reading = analogRead(sensorPins[i]);
         
         // 更新平滑化數組
@@ -121,29 +130,32 @@ void updateSensorReadings() {
         // 計算平均值
         average[i] = total[i] / numReadings;
         
-        // 將數值映射到 0-100 範圍
+        // 將 ADC 值映射到 0-100 範圍
+        // 0 = 完全伸直
+        // 100 = 完全彎曲
         average[i] = map(average[i], calibration[i].straight, calibration[i].bent, 0, 100);
-        average[i] = constrain(average[i], 0, 100);
+        average[i] = constrain(average[i], 0, 100);  // 確保值在 0-100 範圍內
     }
 }
 
 void calibrateSensors() {
     Serial.println("開始校準...");
+    Serial.println("此過程將設定每個手指的最大和最小值");
     delay(1000);
     
-    Serial.println("請將手指伸直，等待 3 秒...");
+    Serial.println("請將手指完全伸直，等待 3 秒...");
     delay(3000);
     
-    // 讀取伸直時的值
+    // 讀取伸直時的 ADC 值
     int sensorPins[] = {THUMB_PIN, INDEX_PIN, MIDDLE_PIN, RING_PIN, PINKY_PIN};
     for (int i = 0; i < 5; i++) {
         calibration[i].straight = analogRead(sensorPins[i]);
     }
     
-    Serial.println("請將手指彎曲，等待 3 秒...");
+    Serial.println("請將手指完全彎曲，等待 3 秒...");
     delay(3000);
     
-    // 讀取彎曲時的值
+    // 讀取彎曲時的 ADC 值
     for (int i = 0; i < 5; i++) {
         calibration[i].bent = analogRead(sensorPins[i]);
     }
@@ -153,14 +165,15 @@ void calibrateSensors() {
 }
 
 void printCalibrationValues() {
-    Serial.println("校準值:");
+    Serial.println("校準值 (ADC 數值):");
     String fingerNames[] = {"拇指", "食指", "中指", "無名指", "小指"};
     for (int i = 0; i < 5; i++) {
         Serial.print(fingerNames[i]);
         Serial.print(" - 伸直: ");
         Serial.print(calibration[i].straight);
-        Serial.print(", 彎曲: ");
-        Serial.println(calibration[i].bent);
+        Serial.print(" (ADC), 彎曲: ");
+        Serial.print(calibration[i].bent);
+        Serial.println(" (ADC)");
     }
 }
 
